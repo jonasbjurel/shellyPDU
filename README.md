@@ -45,7 +45,7 @@ This PDU script provides non persistant run-time HTTP APIs that enables interact
 **Factory reset:**<br>
 *http://"ShellyURL"/script/\<scriptId>/pdu?factory_reset_to_default*<br>
 Resets and restarts the PDU script to factory default. Default settings as defined in the script will persistantly be applied to the KVS store and any custom configurations needs to be applied again as described in
-the "Script configuration (persistant)" section above. This method does not reset the shelly device as a whole to factory default, but only the shedder script it self.
+the "Script configuration (persistant)" section above. This method does not reset the shelly device as a whole to factory default, but only the PDU script it self.
 
 Response body: Undefined
 
