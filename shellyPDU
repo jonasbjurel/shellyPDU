@@ -1,0 +1,498 @@
+/*********************************************************************************************************
+ * @title: ShellyPdu, a server rack PDU monitoring and reset script
+ * @(C): Jonas Bjurel et Al.
+ * @License: Apache 2 
+ * @description:
+ **********************************************************************************************************/
+
+
+/***********************************************  Todo:   ************************************************
+ * 1) 
+ *
+**********************************************************************************************************/
+
+/********************************************    Constants ***********************************************/
+const LOG_PREFIX = "ShellyPdu"
+const LOG_VERBOSE = 0;
+const LOG_INFO = 1;
+const LOG_WARN = 2;
+const LOG_ERROR = 3;
+const LOG_CRITICAL = 4;
+const CALL_LIMIT = 5;
+/*********************************************************************************************************/
+
+
+
+
+/****************************   Default settings, can be changed with caution    *************************/
+/*************************  But can also be permanently changed with KVS webhooks   **********************/
+let hostname_setting = "";
+let reset_time_setting = 30;
+let scan_interval = 0.5;
+let overload_webhook_uri_setting = "";
+let log_level_setting = LOG_INFO;
+/*********************************************************************************************************/
+
+/***********************************  Program variables, do not change   *********************************/
+let time_to_reset_switch = new Array(4);
+for (let i = 0; i < 4; i++) time_to_reset_switch[i] = 0;
+let shelly_call_records = [];
+let current_scan_time = 0;
+let running = false;
+let last_overrun = false;
+let overrun_cnt = 0;
+let consecutive_overrun_cnt = 0;
+let calls = 0;
+let last_kvs_rev = -1; 
+let delete_KVS_cnt = 0;
+let script_start_time = 0;
+let metrics_updated = false;
+let cpu_load_perc = 0;
+let mem_used = 0;
+let mem_used_perc = 0;
+let mem_free = 0;
+let mem_free_perc = 0;
+let mem_high_watermark = 0;
+let mem_high_watermark_perc = 0;
+let total_mem = 0;
+let call_queue_high_watermark = 0; 
+
+/*********************************************************************************************************/
+
+
+
+
+/*********************************************************************************************************/
+/*                                          Platform functions                                           */
+/*********************************************************************************************************/
+
+/* function def(o);
+ * Check if defined */
+function def(o) {
+  return typeof o !== "undefined";
+}
+
+/* function reboot()
+ * Reboots the Shelly */
+function reboot() {
+  Shelly.Reboot();
+}
+
+/* function restart()
+ * stops the script, the watchdog will restart it */
+function restart() {
+  Shelly.call('Script.Stop', {id: Shelly.getCurrentScriptId()});
+}
+
+function factoryReset() {
+  deleteAllKVS(function(){restart()});
+}
+
+function parseQuery(queryString) {
+  let params = {};
+  if (!queryString) 
+	return params;
+  let pairs = queryString.split("&");
+  for (let i=0; i<pairs.length; i++) {
+    let pair = pairs[i].split("=");
+    if (pair.length === 2)
+      params[pair[0]] = pair[1];
+    else if (pair.length === 1)
+      params[pair[0]] = undefined;
+  }
+  return params;
+}
+
+function pduEndPoint(req, res) {
+  let key_values = parseQuery(req.query);
+  switch(Object.keys(key_values)[0]) {
+    case "factory_reset_to_default":
+      log(LOG_WARN, "Factory reset to default ordered, will delete all KVS entries related to this script and restart the script");
+      factoryReset();
+      res.body = "Factory reset to default ordered, will delete all KVS entries related to this script and restart the script";
+      res.code = 200;     
+      break;
+      
+    case "restart":
+      log(LOG_WARN, "Restart of script ordered - will restart the script");
+      restart();
+      res.body = "Restart of script ordered - will restart the script";
+      res.code = 200;     
+      break;      
+
+    case "measurePerformanceMetrics":
+      queueShellyCall("Script.GetStatus", {id: Shelly.getCurrentScriptId()}, 
+        function (result) {
+          if (result) {
+            metrics_updated = true;
+            cpu_load_perc = result.cpu;
+            mem_used = result.mem_used;
+            mem_used_perc = (result.mem_used/(result.mem_used + result.mem_free) * 100).toFixed(0);
+            mem_free = result.mem_free;
+            mem_free_perc = (result.mem_free/(result.mem_used + result.mem_free) * 100).toFixed(0);
+            mem_high_watermark = result.mem_peak;
+            mem_high_watermark_perc = (result.mem_peak/(result.mem_used + result.mem_free) * 100).toFixed(0);
+            total_mem = (result.mem_used) + result.mem_free;
+          }
+          else {
+            log(LOG_WARN, "No script performance metrics available");
+          }
+        }
+      );
+      res.body = "use getPerformanceMetricMeasurements to get the readings";   
+      res.code = 200;
+      break;
+    
+    case "getPerformanceMetricMeasurements":
+      res.body = JSON.stringify({performanceMetrics: {metricsUpdated: metrics_updated,
+                                 upTime: Math.floor(Date.now()/1000)-script_start_time,
+                                 cpuLoadPerc:cpu_load_perc, memUsed:mem_used,
+                                 memUsedPerc:mem_used_perc, memFree:mem_free,
+                                 memFreePerc:mem_free_perc, memHighWatermark:mem_high_watermark,
+                                 memHighWatermarkPerc:mem_high_watermark_perc,
+                                 totalMem: total_mem, overRuns:overrun_cnt,
+                                 callQueueLength: shelly_call_records.length,
+                                 callQueueLengthHighWaterMark: call_queue_high_watermark}});
+      metrics_updated = false;
+      res.code = 200;
+      break;
+
+    case "getPduStatus":
+      let switch_status = new Array(4)
+      let total_current = 0;
+      let total_power = 0;
+      for (i=0; i<4; i++) {
+        switch_status[i] = Shelly.getComponentStatus("switch", i);
+        total_current += switch_status[i].current;
+        total_power += switch_status[i].apower;
+      }
+      res.body = JSON.stringify({pduStatus: 
+                                  {
+                                    //temperature: Shelly.getComponentStatus("sys"),
+                                    //humidity: Shelly.getComponentStatus("humidity",1).rh,
+                                    totalCurrent: total_current,
+                                    totalPower: total_power,
+                                    voltage: switch_status[0].voltage,
+                                    freq: switch_status[0].freq,
+                                    branches: {0:{current:switch_status[0].current, power:switch_status[0].apower, isOn:switch_status[0].output},
+                                               1:{current:switch_status[1].current, power:switch_status[1].apower, isOn:switch_status[1].output},
+                                               2:{current:switch_status[2].current, power:switch_status[2].apower, isOn:switch_status[2].output},
+                                               3:{current:switch_status[3].current, power:switch_status[3].apower, isOn:switch_status[3].output}},                                 
+                                  }
+                                });
+      res.code = 200;
+      break;
+ 
+     case "toggleBranch:0":
+       queueShellyCall("Switch.Set", { id: 0, on: false });
+       res.body = "Toggle of branch 0 ordered";
+       res.code = 200;
+       break;
+     case "toggleBranch:1":
+       queueShellyCall("Switch.Set", { id: 1, on: false });
+       res.body = "Toggle of branch 1 ordered";
+       res.code = 200;
+       break;
+     case "toggleBranch:2":
+       queueShellyCall("Switch.Set", { id: 2, on: false });
+       res.body = "Toggle of branch 2 ordered";
+       res.code = 200;
+       break;
+     case "toggleBranch:3":
+       queueShellyCall("Switch.Set", { id: 3, on: false });
+       res.body = "Toggle of branch 3 ordered";
+       res.code = 200;
+       break;   
+                 
+    default:
+      res.code = 404;
+      res.body = "Unknown command";
+	  log(LOG_WARN, "Unknown command");
+  	  break;
+  }
+  res.send();  
+}
+
+/* function log(severity, log_entry);
+ * Log entries to console according to "log_level_setting" which can be any of
+ * LOG_VERBOSE, LOG_INFO, LOG_WARN, LOG_ERROR and LOG_CRITICAL */
+function log(severity, log_entry) {
+  if (severity >= log_level_setting)
+    print(LOG_PREFIX + ": " + log_entry);
+}
+
+/* function queueShellyCall()
+ * Queues a shelly call. As Shelly only allows a very limited number of system calls running in parallel,
+ * this functions helps to serialize Shelly calls by queueing them for execution, one after one. */
+function queueShellyCall(method, method_param, cb_fun, cb_fun_params) {
+  shelly_call_records.push({meth:method, meth_param: method_param, cb: cb_fun,
+   cb_params: cb_fun_params});
+  if (shelly_call_records.length > call_queue_high_watermark)
+    call_queue_high_watermark = shelly_call_records.length;
+  if (shelly_call_records.length === 1) {
+    Shelly.emitEvent("continueExecQueuedShellyCalls", {});
+  }
+}
+
+/* function execQueuedShellyCalls()
+ * Executes queued shelly calls, when a call has finished it's synchronous execution,
+ * the next in the queue's execution gets triggered by the "continueExecQueuedShellyCalls"
+ * event */
+function execQueuedShellyCalls(event) {
+  if (shelly_call_records.length && calls < CALL_LIMIT) {
+    calls ++;
+    Shelly.call(shelly_call_records[0].meth, shelly_call_records[0].meth_param,
+      function(result, error_code, error_message, call_record) {
+        if(def(call_record.cb))
+          call_record.cb(result, error_code, error_message, call_record.cb_params);
+        calls--;
+		    if (shelly_call_records.length && calls === CALL_LIMIT-2) {
+		      Shelly.emitEvent("continueExecQueuedShellyCalls", {});
+		      log(LOG_VERBOSE, "Resuming calls");
+		    }
+      },
+      shelly_call_records[0]
+    );
+    shelly_call_records.splice(0, 1);
+    if (shelly_call_records.length)
+      Shelly.emitEvent("continueExecQueuedShellyCalls", {}); 
+  }
+  else {
+    log(LOG_VERBOSE, "Max calls reached, pausing calls");
+  }
+}
+
+/* function shellyCallQueueEmpty()
+ * returns true if the call queue is empty, otherwise false */ 
+function shellyCallQueueEmpty() {
+   if (shelly_call_records.length)
+     return false;
+   else 
+     return true;
+}
+
+
+/* function checkKVS()
+ * Checks if KVS has changed and if so emmits a KVS event */ 
+function checkKVS() {
+  queueShellyCall("KVS.List", { match: "*"}, 
+    function(result, error_code, error_message) {
+      if (def(result) && result.rev !== last_kvs_rev) {
+	    last_kvs_rev = result.rev;
+	    Shelly.emitEvent("KVS", {});
+      }
+    }
+  );
+}
+
+/* function shellyEventCb()
+ * A shelly or user defined event has been triggered */
+function shellyEventCb(event) {
+  switch (event.name) {
+    case "script":
+      switch (event.info.event) {
+        case "continueExecQueuedShellyCalls":													// A Shelly call task is completed, continue
+          execQueuedShellyCalls(event);															// with next.
+          break;
+        case "KVS":
+          updateSettingsFromKVS();
+          break;
+        default:
+          break;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+/* function shellyStatusCb()
+ * The shelly status has change */
+function shellyStatusCb(event) {
+  //print("Got a status change: " + JSON.stringify(event));   
+  switch (event.component) {
+    case "switch:0":
+      if (typeof event.delta.output === "undefined")
+        break;
+      if(!event.delta.output) {
+        time_to_reset_switch[0] = reset_time_setting;
+        log(LOG_INFO, "Inactivating shellyPDU branch " + 0 + " for " + reset_time_setting + " seconds");
+      }
+      break;
+    case "switch:1":
+      if (typeof event.delta.output === "undefined")
+        break;
+      if(!event.delta.output) {
+        time_to_reset_switch[1] = reset_time_setting;
+        log(LOG_INFO, "Inactivating shellyPDU branch " + 1 + " for " + reset_time_setting + " seconds");
+      }
+      break;
+    case "switch:2":
+      if (typeof event.delta.output === "undefined")
+        break;
+      if(!event.delta.output) {
+        time_to_reset_switch[2] = reset_time_setting;
+        log(LOG_INFO, "Inactivating shellyPDU branch " + 2 + " for " + reset_time_setting + " seconds");
+      }
+      break;
+    case "switch:3":
+      if (typeof event.delta.output === "undefined")
+        break;
+      if(!event.delta.output) {
+        time_to_reset_switch[3] = reset_time_setting;
+        log(LOG_INFO, "Inactivating shellyPDU branch " + 3 + " for " + reset_time_setting + " seconds");
+      }
+      break;
+    default:
+      break;
+  }
+}
+/*********************************************************************************************************/
+
+
+
+
+/*********************************************************************************************************/
+/*                                        Application functions                                          */
+/*********************************************************************************************************/
+/* function updateSettingsFromKVS();
+ * This functions sets the script variables from the Shelly Key-Value store which can be user set. */
+function updateSettingsFromKVS() {
+  queueShellyCall("KVS.GetMany", {},
+    function (result, error_code, error_message) {
+      for (let KVS in result.items) {
+        switch (result.items[KVS].key) {
+          case "hostname_setting":
+            if (hostname_setting !== result.items[KVS].value) {
+              hostname_setting = result.items[KVS].value;
+              log(LOG_INFO, "Hostname is set to: " + result.items[KVS].value);
+            }
+            break;
+
+          case "scan_interval":
+             if (scan_interval !== result.items[KVS].value) {
+               scan_interval = result.items[KVS].value;
+               log(LOG_INFO, "Scan interval changed to: " + result.items[KVS].value);
+             }
+             break;
+
+          case "log_level_setting":
+            if (log_level_setting !== result.items[KVS].value) {
+              log_level_setting = result.items[KVS].value;
+              log(LOG_INFO, "Log level changed to: " + result.items[KVS].value);
+            }
+            break;
+            
+          case "reset_time_setting":
+            if (reset_time_setting!== result.items[KVS].value) {
+              reset_time_setting= result.items[KVS].value;
+              log(LOG_INFO, "Reset time changed to: " + result.items[KVS].value);
+            }
+            break;            
+                
+          default:
+            break;
+        }
+      }
+      return; 
+    }
+  );
+}
+
+
+/* function createKV(k, v, over_write);
+ * Creates Key-value store entries from the script defined setting defaults, if "over_write" is 
+ * set to true it will over-write an already existing key-value, otherwise not */
+function createKV(k, v, over_write) {
+  queueShellyCall("KVS.Get", {key:k}, 
+    function (result, error_code, error_message, over_write) {
+       if(!def(result) || over_write) {
+         queueShellyCall("KVS.Set", {key:k, value:v}, 
+           function(result, error_code, error_message) {
+             return;  
+           }
+         );
+       }
+    },
+  );
+}
+
+/* function deleteKV(k);
+ * Deletes Key-value store entries */
+function deleteKV(keys, cb, params) {
+  if (delete_KVS_cnt) return -1;
+  for(let i=0; i<keys.length; i++) {
+    delete_KVS_cnt++;
+    queueShellyCall("KVS.Delete", {key:keys[i]},
+      function(result, error_code, error_message, params) {
+        delete_KVS_cnt--;
+        if(!delete_KVS_cnt && def(params.cb))
+          params.cb(params.params);
+      },
+      {cb:cb, params:params}
+    );
+  }
+}
+
+/* function deleteKvs()
+ * Deletes Key-Value store from script settings */
+function deleteAllKVS(cb, params) {
+  log(LOG_INFO, "Deleting KVS entries used for the ShellyPdu script, when the ShellyPdu" +
+                "script restarts it will populate the KVS store with factory default settings");
+  let delete_items = ["hostname_setting", "scan_interval", "log_level_setting", "reset_time_setting"];
+  deleteKV(delete_items)
+}
+
+/* function updateKvs()
+ * Creates and update the Key-Value store from default settings */
+function updateKvs() {
+  log(LOG_INFO, "Creating KVS entries and setting them to default if not exist, " +
+      "if exist - updating script settings to default");
+  createKV("hostname_setting", hostname_setting, false);
+  createKV("scan_interval", scan_interval, false);
+  createKV("log_level_setting", log_level_setting, false);
+  createKV("reset_time_setting", reset_time_setting, false);
+}
+
+/* function onPowerStatus(idx)
+*/
+function scanPduStatus() {
+  if (!last_overrun)
+	  consecutive_overrun_cnt = 0;
+  if (running) {
+    last_overrun = true;
+    overrun_cnt++;
+	  consecutive_overrun_cnt++;
+    log(LOG_WARN, "Overrun - Overrun count is: " + overrun_cnt + " and consecutive overrun count is: " + consecutive_overrun_cnt);
+    return;
+  }
+  running = true;
+  if (!(current_scan_time % 10)) 
+    checkKVS();
+  for (let i=0; i<4; i++) {
+    if (time_to_reset_switch[i]) {
+      if ((time_to_reset_switch[i] -= scan_interval) <= 0) {
+        time_to_reset_switch[i] = 0;
+        if (!Shelly.getComponentStatus("switch", i).output) {
+          queueShellyCall("Switch.Set", { id: i, on: true });
+          log(LOG_INFO, "Reactivating shellyPDU branch " + i);         
+        }
+      }
+    }
+  }
+  current_scan_time += scan_interval;
+  running = false;
+}
+
+/*********************************************************************************************************/
+/*                                              main/init                                                */
+/*********************************************************************************************************/
+script_start_time = Math.floor(Date.now() / 1000)
+for(i=0; i<4; i++)
+  queueShellyCall("Switch.Set", { id: i, on: true });
+updateKvs();
+HTTPServer.registerEndpoint("pdu", pduEndPoint);
+Shelly.addEventHandler(shellyEventCb);
+Shelly.addStatusHandler(shellyStatusCb);
+Timer.set(scan_interval * 1000, true, scanPduStatus);
+/*********************************************************************************************************/
